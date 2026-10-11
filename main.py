@@ -753,7 +753,7 @@ if __name__ == "__main__":
     if run_mode == "tournament":
         seasonal_tournament_reports = asyncio.run(
             template_bot.forecast_on_tournament(
-                33121  # Fall 2026 FutureEval, return_exceptions=True
+                33121, return_exceptions=True  # Fall 2026 FutureEval
             )
         )
         minibench_reports = asyncio.run(
@@ -761,7 +761,14 @@ if __name__ == "__main__":
                 client.CURRENT_MINIBENCH_ID, return_exceptions=True
             )
         )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
+        market_pulse_reports = asyncio.run(
+            template_bot.forecast_on_tournament(
+                33131, return_exceptions=True  # Market Pulse 26Q4
+            )
+        )
+        forecast_reports = (
+            seasonal_tournament_reports + minibench_reports + market_pulse_reports
+        )
     elif run_mode == "metaculus_cup":
         # The Metaculus Cup may be uninitialized near the start of a season
         # (Jan/May/Sep). MetaculusClient.ACX_2025_TOURNAMENT = 32564 and
