@@ -218,6 +218,7 @@ class FallTemplateBot2026(ForecastBot):
             Before answering you write:
             (a) The time left until the outcome to the question is known.
             (b) The status quo outcome if nothing changed.
+            (b2) A reference class and base rate for events like this, and how the specifics adjust it.
             (c) A brief description of a scenario that results in a No outcome.
             (d) A brief description of a scenario that results in a Yes outcome.
 
@@ -250,7 +251,7 @@ class FallTemplateBot2026(ForecastBot):
             num_validation_samples=self._structure_output_validation_samples,
             additional_instructions=parsing_instructions,
         )
-        decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+        decimal_pred = max(0.03, min(0.97, binary_prediction.prediction_in_decimal))  # avoid extreme probabilities (log-score protection)
 
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {decimal_pred}."
@@ -288,6 +289,7 @@ class FallTemplateBot2026(ForecastBot):
             Before answering you write:
             (a) The time left until the outcome to the question is known.
             (b) The status quo outcome if nothing changed.
+            (b2) A reference class and base rate for events like this, and how the specifics adjust it.
             (c) A description of a scenario that results in an unexpected outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
@@ -697,11 +699,16 @@ if __name__ == "__main__":
         default="tournament",
         help="What to forecast on (default: tournament)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do not submit forecasts/comments to Metaculus; save reports to ./reports instead",
+    )
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
-    check_environment(strict=True)
-    publish_to_metaculus = True
+    check_environment(strict=not args.dry_run)
+    publish_to_metaculus = not args.dry_run
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
     # Configure the bot. The `llms=` block below is commented out to use
@@ -712,7 +719,7 @@ if __name__ == "__main__":
         predictions_per_research_report=5,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
-        folder_to_save_reports_to=None,
+        folder_to_save_reports_to="reports" if args.dry_run else None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         # llms={
