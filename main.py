@@ -686,7 +686,7 @@ class FallTemplateBot2026(ForecastBot):
 
 
 
-MARKET_PULSE_REFORECAST_HOURS = 23  # slightly under 24h so the 20-min cron hits once a day
+MARKET_PULSE_REFORECAST_HOURS = 71  # ~every 3 days, slightly under 72h so the 20-min cron hits on time
 
 
 async def forecast_market_pulse_daily(
