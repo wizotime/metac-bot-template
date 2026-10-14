@@ -1,7 +1,7 @@
 import argparse
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 import dotenv
@@ -685,6 +685,47 @@ class FallTemplateBot2026(ForecastBot):
         )
 
 
+
+MARKET_PULSE_REFORECAST_HOURS = 23  # slightly under 24h so the 20-min cron hits once a day
+
+
+async def forecast_market_pulse_daily(
+    bot: ForecastBot, tournament_id: int | str
+) -> list:
+    """Forecast new Market Pulse questions and re-forecast ones whose last
+    forecast of ours is older than MARKET_PULSE_REFORECAST_HOURS.
+    Questions forecast more recently (or with unknown timestamp) are skipped.
+    Only used for Market Pulse; other tournaments keep the default behavior."""
+    questions = bot.metaculus_client.get_all_open_questions_from_tournament(
+        tournament_id
+    )
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        hours=MARKET_PULSE_REFORECAST_HOURS
+    )
+    due = []
+    for q in questions:
+        if not q.already_forecasted:
+            due.append(q)
+            continue
+        try:
+            last = q.timestamp_of_my_last_forecast
+        except Exception:
+            last = None
+        if last is not None and last < cutoff:
+            due.append(q)
+    logger.info(
+        f"Market Pulse {tournament_id}: {len(due)} of {len(questions)} open questions due "
+        f"(new or last forecast > {MARKET_PULSE_REFORECAST_HOURS}h ago)"
+    )
+    if not due:
+        return []
+    previous_skip = bot.skip_previously_forecasted_questions
+    bot.skip_previously_forecasted_questions = False
+    try:
+        return await bot.forecast_questions(due, return_exceptions=True)
+    finally:
+        bot.skip_previously_forecasted_questions = previous_skip
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
@@ -762,9 +803,7 @@ if __name__ == "__main__":
             )
         )
         market_pulse_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                33131, return_exceptions=True  # Market Pulse 26Q4
-            )
+            forecast_market_pulse_daily(template_bot, 33131)  # Market Pulse 26Q4
         )
         forecast_reports = (
             seasonal_tournament_reports + minibench_reports + market_pulse_reports
