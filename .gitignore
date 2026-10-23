@@ -175,3 +175,4 @@ cython_debug/
 # Local scratch/temp scripts
 temp/
 reports/
+.cost_ledger/

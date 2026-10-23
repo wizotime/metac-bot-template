@@ -5,6 +5,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 import dotenv
+from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import (
+    MonetaryCostManager,
+)
+
+from cost_and_percentiles import (
+    COST_LEDGER_PATH,
+    MONTHLY_COST_CAP_USD,
+    add_spend,
+    cap_reached,
+    fix_percentile_list,
+    load_ledger,
+    month_spend,
+)
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
@@ -426,6 +439,7 @@ class FallTemplateBot2026(ForecastBot):
             additional_instructions=parsing_instructions,
             num_validation_samples=self._structure_output_validation_samples,
         )
+        percentile_list = fix_percentile_list(percentile_list, question)
         prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
@@ -791,18 +805,41 @@ if __name__ == "__main__":
     # exceptions, since return_exceptions=True) which then flows into the
     # summary printers below.
     client = MetaculusClient()
+    spent_before = month_spend(load_ledger())
+    logger.info(
+        f"Monthly cost ledger: ${spent_before:.4f} spent this month "
+        f"(cap ${MONTHLY_COST_CAP_USD:.2f}, file {COST_LEDGER_PATH})"
+    )
+    if publish_to_metaculus and cap_reached():
+        logger.warning(
+            f"MONTHLY COST CAP REACHED: ${spent_before:.4f} >= ${MONTHLY_COST_CAP_USD:.2f}. "
+            "Skipping all forecasts this run."
+        )
+        raise SystemExit(0)
+    run_cost_manager = MonetaryCostManager()
+    run_cost_manager.__enter__()
+
+    def _cap_hit_mid_run() -> bool:
+        projected = spent_before + run_cost_manager.current_usage
+        if publish_to_metaculus and projected >= MONTHLY_COST_CAP_USD:
+            logger.warning(
+                f"MONTHLY COST CAP REACHED mid-run (${projected:.4f}); skipping remaining tournaments."
+            )
+            return True
+        return False
+
     if run_mode == "tournament":
         seasonal_tournament_reports = asyncio.run(
             template_bot.forecast_on_tournament(
                 33121, return_exceptions=True  # Fall 2026 FutureEval
             )
         )
-        minibench_reports = asyncio.run(
+        minibench_reports = [] if _cap_hit_mid_run() else asyncio.run(
             template_bot.forecast_on_tournament(
                 client.CURRENT_MINIBENCH_ID, return_exceptions=True
             )
         )
-        market_pulse_reports = asyncio.run(
+        market_pulse_reports = [] if _cap_hit_mid_run() else asyncio.run(
             forecast_market_pulse_daily(template_bot, 33131)  # Market Pulse 26Q4
         )
         forecast_reports = (
@@ -830,6 +867,14 @@ if __name__ == "__main__":
             )
         )
 
+    run_cost = run_cost_manager.current_usage
+    run_cost_manager.__exit__(None, None, None)
+    if publish_to_metaculus:
+        month_total = add_spend(run_cost)
+        logger.info(
+            f"Run cost ${run_cost:.4f}; month total now ${month_total:.4f} "
+            f"of cap ${MONTHLY_COST_CAP_USD:.2f}"
+        )
     template_bot.log_report_summary(forecast_reports)
     print_run_summary_banner(
         forecast_reports,
