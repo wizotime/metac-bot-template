@@ -37,6 +37,15 @@ jobs:
       #     key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
       - name: Install dependencies
         run: poetry install --no-interaction --no-root
+      # Monthly cost ledger (see cost_and_percentiles.py). The ledger is keyed by
+      # month inside the JSON, so restoring the newest cache is enough.
+      - name: Restore cost ledger
+        uses: actions/cache/restore@v4
+        with:
+          path: .cost_ledger
+          key: cost-ledger-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            cost-ledger-
       - name: Run bot
         run: |
           poetry run python main.py
@@ -52,3 +61,9 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+      - name: Save cost ledger
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .cost_ledger
+          key: cost-ledger-${{ github.run_id }}-${{ github.run_attempt }}
