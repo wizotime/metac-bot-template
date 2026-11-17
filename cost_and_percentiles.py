@@ -64,7 +64,7 @@ def fix_percentile_list(percentile_list, question):
 # Stop new forecasts once the estimated LLM spend this calendar month (UTC)
 # reaches this many USD. Kept well under 10 CHF because forecasting_tools'
 # estimate does not include Google Search grounding costs.
-MONTHLY_COST_CAP_USD = float(os.getenv("MONTHLY_COST_CAP_USD", "10.0"))
+MONTHLY_COST_CAP_USD = float(os.getenv("MONTHLY_COST_CAP_USD", "12.0"))
 COST_LEDGER_PATH = os.getenv("COST_LEDGER_PATH", ".cost_ledger/ledger.json")
 
 
