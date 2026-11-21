@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import contextvars
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -17,6 +18,17 @@ from cost_and_percentiles import (
     fix_percentile_list,
     load_ledger,
     month_spend,
+)
+
+from shrink_escalate import (
+    ShrinkEscalateConfig,
+    binary_is_uncertain,
+    blend_binary,
+    blend_mc,
+    escalation_allowed,
+    mc_is_uncertain,
+    postprocess_binary,
+    register_escalate_model_pricing,
 )
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
@@ -139,6 +151,114 @@ class FallTemplateBot2026(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
+    ############################ SHRINKAGE / MODEL ESCALATION (flags, default OFF) ############################
+    # See shrink_escalate.py for the environment variables.
+    _se_cfg: ShrinkEscalateConfig = ShrinkEscalateConfig.from_env()
+    # Month spend before this run (set by __main__), used to keep escalations under the cap.
+    _month_spend_before_run: float = 0.0
+    _run_cost_manager = None
+    # Per-question value of the escalated (strong-model) prediction, keyed by id(question).
+    _escalated: dict = {}
+    _llm_override: contextvars.ContextVar = contextvars.ContextVar(
+        "sanbe_llm_override", default=None
+    )
+
+    def _forecast_llm(self) -> GeneralLlm:
+        override = self._llm_override.get()
+        return override if override is not None else self.get_llm("default", "llm")
+
+    def _escalation_budget_ok(self) -> bool:
+        spent = self._month_spend_before_run
+        if self._run_cost_manager is not None:
+            spent += self._run_cost_manager.current_usage
+        ok = escalation_allowed(spent, MONTHLY_COST_CAP_USD, self._se_cfg)
+        if not ok:
+            logger.info(
+                f"Escalation skipped: month spend ${spent:.4f} >= "
+                f"{self._se_cfg.escalate_budget_share:.0%} of cap ${MONTHLY_COST_CAP_USD:.2f}"
+            )
+        return ok
+
+    def _should_escalate(self, question: MetaculusQuestion, values: list) -> bool:
+        cfg = self._se_cfg
+        if not cfg.escalate_model or not values:
+            return False
+        if isinstance(question, BinaryQuestion):
+            return binary_is_uncertain([float(v) for v in values], cfg)
+        if isinstance(question, MultipleChoiceQuestion):
+            dicts = [
+                {o.option_name: o.probability for o in v.predicted_options}
+                for v in values
+            ]
+            return mc_is_uncertain(dicts, cfg)
+        return False
+
+    async def _research_and_make_predictions(self, question: MetaculusQuestion):
+        result = await super()._research_and_make_predictions(question)
+        values = [p.prediction_value for p in result.predictions]
+        if not self._should_escalate(question, values) or not self._escalation_budget_ok():
+            return result
+        cfg = self._se_cfg
+        strong_llm = GeneralLlm(model=cfg.escalate_model_name, timeout=300, allowed_tries=2)
+        research = (
+            result.summary_report if self.use_research_summary_to_forecast else result.research_report
+        )
+        token = self._llm_override.set(strong_llm)
+        try:
+            strong = await self._make_prediction(question, research)
+        except Exception as e:  # never lose the cheap forecasts because of escalation
+            logger.warning(f"Escalation with {cfg.escalate_model_name} failed for {question.page_url}: {e}")
+            return result
+        finally:
+            self._llm_override.reset(token)
+        logger.info(
+            f"Escalated {question.page_url} to {cfg.escalate_model_name}: "
+            f"cheap={values} strong={strong.prediction_value}"
+        )
+        self._escalated[id(question)] = strong.prediction_value
+        strong = strong.model_copy(
+            update={"reasoning": f"[Escalated to {cfg.escalate_model_name}]\n{strong.reasoning}"}
+        )
+        result.predictions.append(strong)
+        return result
+
+    async def _aggregate_predictions(self, predictions: list, question: MetaculusQuestion):
+        cfg = self._se_cfg
+        strong = self._escalated.pop(id(question), None)
+        if strong is not None:
+            cheap = [p for p in predictions if p is not strong]
+            if len(cheap) == len(predictions):  # identity lost; fall back to equality
+                cheap = list(predictions)
+                cheap.remove(strong)
+            predictions = cheap or predictions
+        aggregated = await super()._aggregate_predictions(predictions, question)
+        if strong is not None and cheap:
+            if isinstance(question, BinaryQuestion):
+                aggregated = blend_binary(float(aggregated), float(strong), cfg.escalate_weight)
+            elif isinstance(question, MultipleChoiceQuestion):
+                base = {o.option_name: o.probability for o in aggregated.predicted_options}
+                st = {o.option_name: o.probability for o in strong.predicted_options}
+                mixed = blend_mc(base, st, cfg.escalate_weight)
+                aggregated = aggregated.model_copy(
+                    update={
+                        "predicted_options": [
+                            o.model_copy(update={"probability": mixed[o.option_name]})
+                            for o in aggregated.predicted_options
+                        ]
+                    }
+                )
+        if isinstance(question, BinaryQuestion):
+            before = float(aggregated)
+            aggregated = postprocess_binary(
+                before, question.community_prediction_at_access_time, cfg
+            )
+            if abs(aggregated - before) > 1e-9:
+                logger.info(
+                    f"Post-processed {question.page_url}: {before:.4f} -> {aggregated:.4f} "
+                    f"(CP={question.community_prediction_at_access_time})"
+                )
+        return aggregated
+
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
@@ -249,7 +369,7 @@ class FallTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._forecast_llm().invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -264,7 +384,8 @@ class FallTemplateBot2026(ForecastBot):
             num_validation_samples=self._structure_output_validation_samples,
             additional_instructions=parsing_instructions,
         )
-        decimal_pred = max(0.03, min(0.97, binary_prediction.prediction_in_decimal))  # avoid extreme probabilities (log-score protection)
+        cfg = self._se_cfg
+        decimal_pred = max(cfg.clamp_min, min(cfg.clamp_max, binary_prediction.prediction_in_decimal))  # avoid extreme probabilities (log-score protection)
 
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {decimal_pred}."
@@ -332,7 +453,7 @@ class FallTemplateBot2026(ForecastBot):
             {self._create_resolved_question_parsing_message()}
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._forecast_llm().invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning,
@@ -818,6 +939,17 @@ if __name__ == "__main__":
         raise SystemExit(0)
     run_cost_manager = MonetaryCostManager()
     run_cost_manager.__enter__()
+    FallTemplateBot2026._month_spend_before_run = spent_before
+    FallTemplateBot2026._run_cost_manager = run_cost_manager
+    _se = FallTemplateBot2026._se_cfg
+    if _se.escalate_model:
+        register_escalate_model_pricing(_se)
+    logger.info(
+        f"Flags: SHRINK_TO_COMMUNITY={_se.shrink_to_community} (w={_se.shrink_weight}, "
+        f"fallback w={_se.shrink_fallback_weight}), ESCALATE_MODEL={_se.escalate_model} "
+        f"({_se.escalate_model_name}, spread>={_se.escalate_spread}, "
+        f"mid=[{_se.escalate_mid_low},{_se.escalate_mid_high}], w={_se.escalate_weight})"
+    )
 
     def _cap_hit_mid_run() -> bool:
         projected = spent_before + run_cost_manager.current_usage
