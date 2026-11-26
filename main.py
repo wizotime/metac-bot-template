@@ -9,6 +9,7 @@ import dotenv
 from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import (
     MonetaryCostManager,
 )
+from forecasting_tools.data_models.forecast_report import ResearchWithPredictions
 
 from cost_and_percentiles import (
     COST_LEDGER_PATH,
@@ -16,6 +17,7 @@ from cost_and_percentiles import (
     add_spend,
     cap_reached,
     fix_percentile_list,
+    widen_open_tails,
     load_ledger,
     month_spend,
 )
@@ -25,6 +27,9 @@ from shrink_escalate import (
     binary_is_uncertain,
     blend_binary,
     blend_mc,
+    binary_in_broad_range,
+    broad_active,
+    effective_budget_share,
     escalation_allowed,
     mc_is_uncertain,
     postprocess_binary,
@@ -175,7 +180,7 @@ class FallTemplateBot2026(ForecastBot):
         if not ok:
             logger.info(
                 f"Escalation skipped: month spend ${spent:.4f} >= "
-                f"{self._se_cfg.escalate_budget_share:.0%} of cap ${MONTHLY_COST_CAP_USD:.2f}"
+                f"{effective_budget_share(self._se_cfg):.0%} of cap ${MONTHLY_COST_CAP_USD:.2f}"
             )
         return ok
 
@@ -193,34 +198,104 @@ class FallTemplateBot2026(ForecastBot):
             return mc_is_uncertain(dicts, cfg)
         return False
 
-    async def _research_and_make_predictions(self, question: MetaculusQuestion):
-        result = await super()._research_and_make_predictions(question)
-        values = [p.prediction_value for p in result.predictions]
-        if not self._should_escalate(question, values) or not self._escalation_budget_ok():
-            return result
+    async def _strong_prediction(self, question: MetaculusQuestion, research: str, cheap_values: list):
+        """One forecast with the escalation model; None if it fails (caller keeps flash)."""
         cfg = self._se_cfg
         strong_llm = GeneralLlm(model=cfg.escalate_model_name, timeout=300, allowed_tries=2)
-        research = (
-            result.summary_report if self.use_research_summary_to_forecast else result.research_report
-        )
         token = self._llm_override.set(strong_llm)
         try:
             strong = await self._make_prediction(question, research)
         except Exception as e:  # never lose the cheap forecasts because of escalation
             logger.warning(f"Escalation with {cfg.escalate_model_name} failed for {question.page_url}: {e}")
-            return result
+            return None
         finally:
             self._llm_override.reset(token)
         logger.info(
             f"Escalated {question.page_url} to {cfg.escalate_model_name}: "
-            f"cheap={values} strong={strong.prediction_value}"
+            f"cheap={cheap_values} strong={strong.prediction_value}"
         )
         self._escalated[id(question)] = strong.prediction_value
-        strong = strong.model_copy(
+        return strong.model_copy(
             update={"reasoning": f"[Escalated to {cfg.escalate_model_name}]\n{strong.reasoning}"}
         )
-        result.predictions.append(strong)
+
+    async def _research_and_make_predictions(self, question: MetaculusQuestion):
+        cfg = self._se_cfg
+        if (
+            cfg.escalate_model
+            and broad_active(cfg)
+            and isinstance(question, (BinaryQuestion, MultipleChoiceQuestion))
+        ):
+            return await self._research_and_predict_broad(question)
+        result = await super()._research_and_make_predictions(question)
+        values = [p.prediction_value for p in result.predictions]
+        if not self._should_escalate(question, values) or not self._escalation_budget_ok():
+            return result
+        research = (
+            result.summary_report if self.use_research_summary_to_forecast else result.research_report
+        )
+        strong = await self._strong_prediction(question, research, values)
+        if strong is not None:
+            result.predictions.append(strong)
         return result
+
+    async def _research_and_predict_broad(self, question: MetaculusQuestion):
+        """Broad escalation (from ESCALATE_BROAD_FROM): 1 flash forecast first; if the
+        question is in the escalation range, the strong model replaces the 2nd flash."""
+        cfg = self._se_cfg
+        notepad = await self._get_notepad(question)
+        notepad.total_research_reports_attempted += 1
+        research = await self.run_research(question)
+        summary_report = await self.summarize_research(question, research)
+        research_to_use = summary_report if self.use_research_summary_to_forecast else research
+
+        errors: list[str] = []
+        preds: list = []
+
+        async def flash():
+            try:
+                preds.append(await self._make_prediction(question, research_to_use))
+            except Exception as e:
+                logger.warning(f"Flash forecast failed for {question.page_url}: {e}")
+                errors.append(f"{type(e).__name__}: {e}")
+
+        await flash()
+        if not preds:  # one retry so a transient error does not cost the question
+            await flash()
+        if not preds:
+            raise RuntimeError(f"All flash forecasts failed for {question.page_url}: {errors}")
+
+        first = preds[0].prediction_value
+        if isinstance(question, BinaryQuestion):
+            in_range = binary_in_broad_range(float(first), cfg)
+        else:
+            in_range = True  # all multiple-choice questions
+        tried_strong = False
+        if in_range and self._escalation_budget_ok():
+            tried_strong = True
+            strong = await self._strong_prediction(question, research_to_use, [first])
+            if strong is not None:
+                preds.append(strong)
+                return ResearchWithPredictions(
+                    research_report=research, summary_report=summary_report,
+                    errors=errors, predictions=preds,
+                )
+        # not in range, no budget, or strong model failed: second flash forecast as before
+        await flash()
+        values = [p.prediction_value for p in preds]
+        if (
+            not tried_strong
+            and len(values) >= 2
+            and self._should_escalate(question, values)
+            and self._escalation_budget_ok()
+        ):
+            strong = await self._strong_prediction(question, research_to_use, values)
+            if strong is not None:
+                preds.append(strong)
+        return ResearchWithPredictions(
+            research_report=research, summary_report=summary_report,
+            errors=errors, predictions=preds,
+        )
 
     async def _aggregate_predictions(self, predictions: list, question: MetaculusQuestion):
         cfg = self._se_cfg
@@ -505,7 +580,7 @@ class FallTemplateBot2026(ForecastBot):
             Formatting Instructions:
             - Please notice the units requested and give your answer in these units (e.g. whether you represent a number as 1,000,000 or 1 million).
             - Never use scientific notation.
-            - Always start with a smaller number (more negative if negative) and then increase from there. The value for percentile 10 should always be less than the value for percentile 20, and so on.
+            - Always start with a smaller number (more negative if negative) and then increase from there. The value for percentile 5 should always be less than the value for percentile 10, and so on.
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
@@ -517,15 +592,18 @@ class FallTemplateBot2026(ForecastBot):
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+            Outcomes beyond the question's stated range happen regularly. If your median or the most recent observed value mentioned in the research is near (within about 10% of the range) or beyond an open bound, put at least 12-15% probability beyond that bound: your Percentile 85 should then be at or above an open upper bound (or your Percentile 15 at or below an open lower bound).
 
             The last thing you write is your final answer as:
             "
-            Percentile 10: XX (lowest number value)
+            Percentile 5: XX (lowest number value)
+            Percentile 10: XX
             Percentile 20: XX
             Percentile 40: XX
             Percentile 60: XX
             Percentile 80: XX
-            Percentile 90: XX (highest number value)
+            Percentile 90: XX
+            Percentile 95: XX (highest number value)
             "
             """
         )
@@ -561,7 +639,15 @@ class FallTemplateBot2026(ForecastBot):
             num_validation_samples=self._structure_output_validation_samples,
         )
         percentile_list = fix_percentile_list(percentile_list, question)
-        prediction = NumericDistribution.from_question(percentile_list, question)
+        widened = widen_open_tails(percentile_list, question)
+        try:
+            prediction = NumericDistribution.from_question(widened, question)
+            prediction.get_cdf()  # validate the full CDF before using the widened tails
+        except Exception as e:
+            if widened is percentile_list:
+                raise
+            logger.warning(f"Widened tails rejected for {question.page_url} ({e}); using original")
+            prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
         )
@@ -948,7 +1034,10 @@ if __name__ == "__main__":
         f"Flags: SHRINK_TO_COMMUNITY={_se.shrink_to_community} (w={_se.shrink_weight}, "
         f"fallback w={_se.shrink_fallback_weight}), ESCALATE_MODEL={_se.escalate_model} "
         f"({_se.escalate_model_name}, spread>={_se.escalate_spread}, "
-        f"mid=[{_se.escalate_mid_low},{_se.escalate_mid_high}], w={_se.escalate_weight})"
+        f"mid=[{_se.escalate_mid_low},{_se.escalate_mid_high}], w={_se.escalate_weight}, "
+        f"budget share {effective_budget_share(_se):.2f}); broad escalation from "
+        f"{_se.escalate_broad_from or 'never'} -> active now: {broad_active(_se)} "
+        f"(binary [{_se.escalate_broad_low},{_se.escalate_broad_high}] + all MC)"
     )
 
     def _cap_hit_mid_run() -> bool:

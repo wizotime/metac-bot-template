@@ -2,6 +2,11 @@ name: Forecast on new AI tournament questions
 
 on:
   workflow_dispatch:
+    inputs:
+      smoke_test_escalation:
+        description: "Make one tiny live call to the escalation model before the run"
+        type: boolean
+        default: false
   schedule:
     # Every 40 minutes (36 runs/day, UTC). Make sure to skip already-forecasted questions!
     - cron: "0 0-23/2 * * *"
@@ -49,6 +54,13 @@ jobs:
           key: cost-ledger-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             cost-ledger-
+      - name: Smoke test escalation model (manual runs only)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.smoke_test_escalation }}
+        continue-on-error: true
+        run: poetry run python scripts/smoke_escalate_model.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ESCALATE_MODEL_NAME: "gemini/gemini-4-hydrogen"
       - name: Run bot
         run: |
           poetry run python main.py
@@ -69,6 +81,10 @@ jobs:
           ESCALATE_MODEL_NAME: "gemini/gemini-4-hydrogen"
           ESCALATE_INPUT_USD_PER_M: "1.5"
           ESCALATE_OUTPUT_USD_PER_M: "7.5"
+          # Broad escalation from 1 Dec 2026 (Zurich date; approved 2026-11-26):
+          # binary 0.15-0.85 and all MC -> 1 flash + strong model; budget share 0.95
+          ESCALATE_BROAD_FROM: "2026-12-01"
+          ESCALATE_BROAD_BUDGET_SHARE: "0.95"
       - name: Save cost ledger
         if: always()
         uses: actions/cache/save@v4

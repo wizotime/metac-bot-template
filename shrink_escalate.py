@@ -26,6 +26,18 @@ ESCALATE_MID_LOW / _HIGH     Binary: also escalate if the median lies in [0.35, 
 ESCALATE_WEIGHT=0.5          Weight of the strong model's forecast in the final blend.
 ESCALATE_BUDGET_SHARE=0.8    Skip escalation once month spend >= share * monthly cap,
                              so the cap is never reached because of escalations.
+
+Broad escalation (approved 2026-11-26), active from ESCALATE_BROAD_FROM (YYYY-MM-DD,
+Europe/Zurich date; empty = never):
+ESCALATE_BROAD_FROM          e.g. 2026-12-01. From that day on, binary and MC questions
+                             first get ONE cheap forecast. Binary questions whose cheap
+                             forecast lies in [ESCALATE_BROAD_LOW, ESCALATE_BROAD_HIGH]
+                             and all MC questions then get the strong model INSTEAD of a
+                             second cheap forecast. Other binaries get the second cheap
+                             forecast and still escalate under the spread rule above.
+ESCALATE_BROAD_LOW / _HIGH   default 0.15 / 0.85.
+ESCALATE_BROAD_BUDGET_SHARE  default 0.95; replaces ESCALATE_BUDGET_SHARE once broad
+                             escalation is active.
 """
 
 from __future__ import annotations
@@ -34,6 +46,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +85,10 @@ class ShrinkEscalateConfig:
     escalate_mid_high: float = 0.65
     escalate_weight: float = 0.5
     escalate_budget_share: float = 0.8
+    escalate_broad_from: str = ""
+    escalate_broad_low: float = 0.15
+    escalate_broad_high: float = 0.85
+    escalate_broad_budget_share: float = 0.95
 
     @classmethod
     def from_env(cls) -> "ShrinkEscalateConfig":
@@ -98,6 +115,12 @@ class ShrinkEscalateConfig:
             escalate_weight=_clip01(_env_float("ESCALATE_WEIGHT", d.escalate_weight)),
             escalate_budget_share=_env_float(
                 "ESCALATE_BUDGET_SHARE", d.escalate_budget_share
+            ),
+            escalate_broad_from=(os.getenv("ESCALATE_BROAD_FROM") or "").strip(),
+            escalate_broad_low=_env_float("ESCALATE_BROAD_LOW", d.escalate_broad_low),
+            escalate_broad_high=_env_float("ESCALATE_BROAD_HIGH", d.escalate_broad_high),
+            escalate_broad_budget_share=_env_float(
+                "ESCALATE_BROAD_BUDGET_SHARE", d.escalate_broad_budget_share
             ),
         )
 
@@ -186,8 +209,52 @@ def blend_mc(
     return {k: v / total for k, v in mixed.items()}
 
 
-def escalation_allowed(month_spend: float, monthly_cap: float, cfg: ShrinkEscalateConfig) -> bool:
-    return month_spend < cfg.escalate_budget_share * monthly_cap
+def now_zurich() -> datetime:
+    """Current time in Europe/Zurich (fixed UTC+1 fallback if tzdata is missing)."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo("Europe/Zurich"))
+    except Exception:  # pragma: no cover - tzdata missing
+        return datetime.now(timezone(timedelta(hours=1)))
+
+
+def broad_active(cfg: ShrinkEscalateConfig, now: datetime | None = None) -> bool:
+    """True once the Zurich date is on/after ESCALATE_BROAD_FROM (and escalation is on)."""
+    if not cfg.escalate_model or not cfg.escalate_broad_from:
+        return False
+    try:
+        start = date.fromisoformat(cfg.escalate_broad_from)
+    except ValueError:
+        logger.warning(f"Invalid ESCALATE_BROAD_FROM={cfg.escalate_broad_from!r}; broad escalation off")
+        return False
+    if now is None:
+        now = now_zurich()
+    elif now.tzinfo is not None:
+        try:
+            from zoneinfo import ZoneInfo
+
+            now = now.astimezone(ZoneInfo("Europe/Zurich"))
+        except Exception:  # pragma: no cover
+            now = now.astimezone(timezone(timedelta(hours=1)))
+    return now.date() >= start
+
+
+def effective_budget_share(cfg: ShrinkEscalateConfig, now: datetime | None = None) -> float:
+    return cfg.escalate_broad_budget_share if broad_active(cfg, now) else cfg.escalate_budget_share
+
+
+def binary_in_broad_range(p: float, cfg: ShrinkEscalateConfig) -> bool:
+    return cfg.escalate_broad_low <= float(p) <= cfg.escalate_broad_high
+
+
+def escalation_allowed(
+    month_spend: float,
+    monthly_cap: float,
+    cfg: ShrinkEscalateConfig,
+    now: datetime | None = None,
+) -> bool:
+    return month_spend < effective_budget_share(cfg, now) * monthly_cap
 
 
 def register_escalate_model_pricing(cfg: ShrinkEscalateConfig) -> None:
